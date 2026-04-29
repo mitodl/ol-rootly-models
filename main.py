@@ -1,7 +1,9 @@
 import argparse
 import importlib.util
+import json
 import os
 import pprint
+import re
 
 from rootly_sdk import AuthenticatedClient
 from rootly_sdk.api.services import create_service, list_services, update_service
@@ -808,6 +810,105 @@ def run_import(client: AuthenticatedClient, path: str) -> None:
         ensure_escalation_policy(client, policy_dict)
 
 
+# --- Pulumi import export ---
+
+# Maps each resource kind to its Pulumi provider type string.
+_PULUMI_TYPE = {
+    "alert_source":       "rootly:index/alertsSource:AlertsSource",
+    "alert_route":        "rootly:index/alertRoute:AlertRoute",
+    "service":            "rootly:index/service:Service",
+    "role":               "rootly:index/role:Role",
+    "team":               "rootly:index/team:Team",
+    "escalation_policy":  "rootly:index/escalationPolicy:EscalationPolicy",
+}
+
+
+def _slugify(name: str) -> str:
+    """Convert a display name to a valid Pulumi resource name (lowercase, hyphens)."""
+    slug = name.lower().strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    slug = slug.strip("-")
+    # Resource names must start with a letter.
+    if slug and slug[0].isdigit():
+        slug = "r-" + slug
+    return slug or "unnamed"
+
+
+def _build_import_entries(kind: str, items: list) -> list[dict]:
+    """Return a list of Pulumi import entries for a collection of Rootly items."""
+    pulumi_type = _PULUMI_TYPE[kind]
+    entries = []
+    seen_names: dict[str, int] = {}
+    for item in items:
+        display_name = getattr(item.attributes, "name", None) or str(item.id)
+        base_slug = _slugify(str(display_name))
+        # De-duplicate slugs within the same resource type.
+        count = seen_names.get(base_slug, 0)
+        seen_names[base_slug] = count + 1
+        slug = base_slug if count == 0 else f"{base_slug}-{count}"
+        entries.append({
+            "type": pulumi_type,
+            "name": slug,
+            "id": str(item.id),
+            # logicalName preserves the original display name as a comment in generated code.
+            "logicalName": display_name,
+        })
+    return entries
+
+
+def export_pulumi_imports(client: AuthenticatedClient, output_path: str) -> None:
+    """Fetch all Rootly resources and write a Pulumi bulk-import JSON file.
+
+    This function is strictly read-only — it calls only list/get endpoints and
+    does not create, update, or delete anything in Rootly or Pulumi.
+    """
+    print("Fetching resources from Rootly (read-only)...")
+
+    print("  Fetching alert sources...")
+    alert_source_items = fetch_all_alert_sources(client)
+    print("  Fetching alert routes...")
+    alert_route_items = fetch_all_alert_routes(client)
+    print("  Fetching services...")
+    service_items = fetch_all_services(client)
+    print("  Fetching roles...")
+    role_items = fetch_all_roles(client)
+    print("  Fetching teams...")
+    team_items = fetch_all_teams(client)
+    print("  Fetching escalation policies...")
+    escalation_policy_items = fetch_all_escalation_policies(client)
+
+    resources = (
+        _build_import_entries("alert_source", alert_source_items)
+        + _build_import_entries("alert_route", alert_route_items)
+        + _build_import_entries("service", service_items)
+        + _build_import_entries("role", role_items)
+        + _build_import_entries("team", team_items)
+        + _build_import_entries("escalation_policy", escalation_policy_items)
+    )
+
+    import_doc = {"resources": resources}
+
+    with open(output_path, "w") as f:
+        json.dump(import_doc, f, indent=2)
+
+    counts = {
+        "alert_sources": len(alert_source_items),
+        "alert_routes": len(alert_route_items),
+        "services": len(service_items),
+        "roles": len(role_items),
+        "teams": len(team_items),
+        "escalation_policies": len(escalation_policy_items),
+    }
+    total = sum(counts.values())
+    print(f"\nWrote {total} import entries to {output_path}:")
+    for kind, count in counts.items():
+        print(f"  {kind}: {count}")
+    print(
+        f"\nTo import into Pulumi, run from your monitoring stack directory:\n"
+        f"  pulumi import --file {os.path.abspath(output_path)} --generate-code"
+    )
+
+
 # --- Entry point ---
 
 def main():
@@ -827,13 +928,25 @@ def main():
         help="Fetch all services and roles from Rootly and overwrite data.py",
     )
     parser.add_argument(
+        "--pulumi-import",
+        dest="pulumi_import_file",
+        nargs="?",
+        const="pulumi_imports.json",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Fetch all Rootly resources and write a Pulumi bulk-import JSON file "
+            "(default: pulumi_imports.json). Read-only — nothing is modified."
+        ),
+    )
+    parser.add_argument(
         "--report",
         action="store_true",
         help="Print a report of all current services and roles",
     )
     args = parser.parse_args()
 
-    if not (args.import_file or args.export or args.report):
+    if not (args.import_file or args.export or args.report or args.pulumi_import_file):
         parser.print_help()
         return
 
@@ -852,6 +965,8 @@ def main():
             run_import(client, args.import_file)
         elif args.export:
             export_to_data_file(client)
+        elif args.pulumi_import_file:
+            export_pulumi_imports(client, args.pulumi_import_file)
         elif args.report:
             print_report(client)
 
